@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 submission.zip
 Ensem_v2 (1).ipynb
 Ensem_v2.ipynb
@@ -43,3 +44,25 @@ test_features.csv
 training_features_with_labels.csv
 Unsupervised Models.ipynb
 XGBoost_v3.ipynb
+=======
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+__pycache__
+*.pyc
+*.pyo
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+>>>>>>> 0752d1b6749700d5522aebfb9d490cd388f8b06a
