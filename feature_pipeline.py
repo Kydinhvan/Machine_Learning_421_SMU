@@ -27,7 +27,11 @@ With combined training batches:
 
 import numpy as np
 import pandas as pd
-from scipy.stats import entropy
+from scipy.stats import entropy, skew, kurtosis
+from scipy.spatial.distance import jensenshannon
+from sklearn.decomposition import TruncatedSVD
+from sklearn.metrics.pairwise import cosine_similarity
+from scipy.sparse import csr_matrix
 
 TOTAL_ITEMS = 1000
 RATING_RANGE = range(6)
@@ -140,7 +144,7 @@ def exclude_test_users(
 # ── 4. Compute item stats ─────────────────────────────────────────────────
 
 
-def compute_item_stats(XX_train: pd.DataFrame) -> dict:
+def compute_item_stats(XX_train: pd.DataFrame, n_svd_components: int = 20) -> dict:
     """Compute item-level statistics from training interactions ONLY.
 
     Pass the returned dict to build_features() for both train and test
@@ -148,10 +152,71 @@ def compute_item_stats(XX_train: pd.DataFrame) -> dict:
     """
     item_avg = XX_train.groupby("item")["rating"].mean().rename("item_avg_rating")
     item_pop = XX_train.groupby("item")["user"].count().rename("item_popularity")
-    return {"item_avg_rating": item_avg, "item_popularity": item_pop}
+
+    # Global rating distribution (for JS divergence)
+    rating_counts = XX_train["rating"].value_counts().reindex(RATING_RANGE, fill_value=0)
+    global_rating_dist = (rating_counts / rating_counts.sum()).values.astype(float)
+
+    # Item popularity percentiles
+    pop_values = item_pop.values
+    pop_25 = np.percentile(pop_values, 25)
+    pop_50 = np.median(pop_values)
+    pop_90 = np.percentile(pop_values, 90)
+
+    # SVD on user-item matrix for MF residuals
+    users = XX_train["user"].unique()
+    items = XX_train["item"].unique()
+    user_map = {u: i for i, u in enumerate(sorted(users))}
+    item_map = {it: i for i, it in enumerate(sorted(items))}
+
+    row_idx = XX_train["user"].map(user_map).values
+    col_idx = XX_train["item"].map(item_map).values
+    ratings = XX_train["rating"].values.astype(float)
+    global_mean = ratings.mean()
+    ratings_centered = ratings - global_mean
+
+    n_users = len(user_map)
+    n_items = len(item_map)
+    R = csr_matrix((ratings_centered, (row_idx, col_idx)), shape=(n_users, n_items))
+
+    n_components = min(n_svd_components, min(n_users, n_items) - 1)
+    svd = TruncatedSVD(n_components=n_components, random_state=42)
+    U_reduced = svd.fit_transform(R)  # (n_users, k)
+    Vt = svd.components_              # (k, n_items)
+
+    # Average user profile (for cosine similarity)
+    avg_user_profile = np.asarray(R.mean(axis=0)).flatten()  # (n_items,)
+
+    # Item rarity threshold
+    rarity_threshold = 5
+
+    return {
+        "item_avg_rating": item_avg,
+        "item_popularity": item_pop,
+        "global_rating_dist": global_rating_dist,
+        "pop_25": pop_25,
+        "pop_50": pop_50,
+        "pop_90": pop_90,
+        "svd_Vt": Vt,
+        "svd_global_mean": global_mean,
+        "svd_item_map": item_map,
+        "avg_user_profile": avg_user_profile,
+        "n_items_svd": n_items,
+        "rarity_threshold": rarity_threshold,
+    }
 
 
 # ── 5. Build features ─────────────────────────────────────────────────────
+
+
+def _gini(array):
+    """Compute Gini coefficient of an array."""
+    array = np.sort(array).astype(float)
+    n = len(array)
+    if n == 0 or array.sum() == 0:
+        return 0.0
+    index = np.arange(1, n + 1)
+    return (2 * np.sum(index * array) - (n + 1) * np.sum(array)) / (n * np.sum(array))
 
 
 def build_features(
@@ -166,7 +231,7 @@ def build_features(
     item_avg = item_stats["item_avg_rating"]
     item_pop = item_stats["item_popularity"]
 
-    # Basic rating statistics
+    # ── Basic rating statistics ──────────────────────────────────────────
     stats = XX.groupby("user")["rating"].agg(
         rating_mean="mean",
         rating_std="std",
@@ -178,7 +243,15 @@ def build_features(
     stats["rating_std"] = stats["rating_std"].fillna(0)
     stats["rating_range"] = stats["rating_max"] - stats["rating_min"]
 
-    # Rating proportions + entropy
+    # Skewness and kurtosis
+    stats["rating_skew"] = XX.groupby("user")["rating"].apply(
+        lambda x: skew(x) if len(x) > 2 else 0.0
+    )
+    stats["rating_kurt"] = XX.groupby("user")["rating"].apply(
+        lambda x: kurtosis(x) if len(x) > 3 else 0.0
+    )
+
+    # ── Rating proportions + entropy ─────────────────────────────────────
     rdist = XX.groupby(["user", "rating"]).size().unstack(fill_value=0)
     rdist = rdist.reindex(columns=RATING_RANGE, fill_value=0)
     rprops = rdist.div(rdist.sum(axis=1), axis=0)
@@ -191,12 +264,27 @@ def build_features(
 
     # Extreme rating proportions
     stats["prop_extreme"] = rprops["prop_rating_0"] + rprops["prop_rating_5"]
+    stats["prop_zero"] = rprops["prop_rating_0"]
+    stats["prop_five"] = rprops["prop_rating_5"]
 
-    # Item coverage
+    # Mid-range vs extreme ratio
+    stats["prop_mid"] = rprops[["prop_rating_2", "prop_rating_3"]].sum(axis=1)
+    stats["extreme_mid_ratio"] = np.clip(
+        stats["prop_extreme"] / (stats["prop_mid"] + 1e-9), 0, 100
+    )
+    stats["prop_near_extreme"] = rprops[["prop_rating_1", "prop_rating_4"]].sum(axis=1)
+
+    # ── Item coverage ────────────────────────────────────────────────────
     stats["unique_items_rated"] = XX.groupby("user")["item"].nunique()
     stats["item_coverage_ratio"] = stats["unique_items_rated"] / total_items
 
-    # Item popularity (frozen from training)
+    # Rating count features
+    median_count = stats["rating_count"].median()
+    stats["rating_count_vs_median"] = stats["rating_count"] / median_count
+    stats["rating_count_log"] = np.log1p(stats["rating_count"])
+    stats["repeat_rating_ratio"] = stats["rating_count"] / (stats["unique_items_rated"] + 1e-9)
+
+    # ── Item popularity (frozen from training) ───────────────────────────
     XX_pop = XX.merge(item_pop, left_on="item", right_index=True, how="left")
     XX_pop["item_popularity"] = XX_pop["item_popularity"].fillna(0)
     pop_f = XX_pop.groupby("user")["item_popularity"].agg(
@@ -206,7 +294,28 @@ def build_features(
     pop_f["std_item_popularity"] = pop_f["std_item_popularity"].fillna(0)
     stats = stats.join(pop_f)
 
-    # Deviation from item average (frozen from training)
+    # Popularity percentile targeting
+    pop_25 = item_stats["pop_25"]
+    pop_50 = item_stats["pop_50"]
+    pop_90 = item_stats["pop_90"]
+
+    stats["prop_bottom25_pop"] = XX_pop.groupby("user")["item_popularity"].apply(
+        lambda x: (x <= pop_25).mean()
+    )
+    stats["prop_top10_pop"] = XX_pop.groupby("user")["item_popularity"].apply(
+        lambda x: (x >= pop_90).mean()
+    )
+    stats["pop_vs_global_median"] = stats["avg_item_popularity"] / pop_50
+
+    # Popularity-weighted rating
+    XX_pop["pop_weighted_rating"] = XX_pop["rating"] * XX_pop["item_popularity"]
+    pwf = XX_pop.groupby("user")["pop_weighted_rating"].sum() / \
+          XX_pop.groupby("user")["item_popularity"].sum()
+    stats["pop_weighted_avg_rating"] = pwf
+
+    stats["count_x_pop"] = stats["rating_count_log"] * stats["pop_vs_global_median"]
+
+    # ── Deviation from item average (frozen from training) ───────────────
     XX_dev = XX.merge(item_avg, left_on="item", right_index=True, how="left")
     global_train_mean = item_avg.mean()
     XX_dev["item_avg_rating"] = XX_dev["item_avg_rating"].fillna(global_train_mean)
@@ -220,6 +329,21 @@ def build_features(
     dev_f["std_deviation"] = dev_f["std_deviation"].fillna(0)
     stats = stats.join(dev_f)
 
+    # Max/min deviation
+    dev_extremes = XX_dev.groupby("user")["deviation"].agg(
+        max_deviation="max", min_deviation="min"
+    )
+    stats = stats.join(dev_extremes)
+    stats["deviation_range"] = stats["max_deviation"] - stats["min_deviation"]
+
+    # Proportion above/below item average
+    stats["prop_above_avg"] = XX_dev.groupby("user").apply(
+        lambda df: (df["deviation"] > 0).mean()
+    )
+    stats["prop_below_avg"] = XX_dev.groupby("user").apply(
+        lambda df: (df["deviation"] < 0).mean()
+    )
+
     # Average quality of items targeted (frozen from training)
     iqf = XX_dev.groupby("user")["item_avg_rating"].agg(
         avg_item_avg_rating="mean",
@@ -227,6 +351,96 @@ def build_features(
     )
     iqf["std_item_avg_rating"] = iqf["std_item_avg_rating"].fillna(0)
     stats = stats.join(iqf)
+
+    # ── NEW: Jensen-Shannon Divergence from population ───────────────────
+    global_dist = item_stats["global_rating_dist"]
+    user_dists = rprops.values  # already computed per-user rating distributions
+    js_divs = []
+    for row in user_dists:
+        row_safe = np.clip(row, 1e-10, None)
+        global_safe = np.clip(global_dist, 1e-10, None)
+        js_divs.append(jensenshannon(row_safe, global_safe))
+    stats["js_divergence"] = js_divs
+
+    # ── NEW: Gini coefficient of item selections ─────────────────────────
+    item_counts_per_user = XX.groupby("user")["item"].value_counts()
+    gini_vals = {}
+    for user_id in stats.index:
+        if user_id in item_counts_per_user.index.get_level_values(0):
+            counts = item_counts_per_user.loc[user_id].values
+            gini_vals[user_id] = _gini(counts)
+        else:
+            gini_vals[user_id] = 0.0
+    stats["item_selection_gini"] = pd.Series(gini_vals)
+
+    # ── NEW: Item rarity features ────────────────────────────────────────
+    rarity_threshold = item_stats["rarity_threshold"]
+    rare_items = set(item_pop[item_pop < rarity_threshold].index)
+    pop_median_val = item_stats["pop_50"]
+    common_items = set(item_pop[item_pop >= pop_median_val].index)
+
+    user_items = XX.groupby("user")["item"].apply(set)
+    stats["prop_rare_items"] = user_items.apply(
+        lambda items: len(items & rare_items) / max(len(items), 1)
+    )
+    stats["prop_common_items"] = user_items.apply(
+        lambda items: len(items & common_items) / max(len(items), 1)
+    )
+
+    # ── NEW: MF residuals (SVD reconstruction error) ─────────────────────
+    svd_Vt = item_stats["svd_Vt"]
+    svd_global_mean = item_stats["svd_global_mean"]
+    svd_item_map = item_stats["svd_item_map"]
+    n_items_svd = item_stats["n_items_svd"]
+
+    mf_rmse_vals = {}
+    mf_mae_vals = {}
+    for user_id, grp in XX.groupby("user"):
+        items = grp["item"].values
+        ratings = grp["rating"].values.astype(float)
+        # Map items to SVD indices; skip unknown items
+        valid_mask = np.array([it in svd_item_map for it in items])
+        if valid_mask.sum() < 2:
+            mf_rmse_vals[user_id] = 0.0
+            mf_mae_vals[user_id] = 0.0
+            continue
+        item_indices = np.array([svd_item_map[it] for it in items[valid_mask]])
+        r_centered = ratings[valid_mask] - svd_global_mean
+        # User's latent vector: solve least squares U_u = R_u @ V^T_pinv
+        V_sub = svd_Vt[:, item_indices].T  # (n_rated, k)
+        u_latent, _, _, _ = np.linalg.lstsq(V_sub, r_centered, rcond=None)
+        r_hat = V_sub @ u_latent
+        residuals = r_centered - r_hat
+        mf_rmse_vals[user_id] = np.sqrt(np.mean(residuals ** 2))
+        mf_mae_vals[user_id] = np.mean(np.abs(residuals))
+
+    stats["mf_rmse"] = pd.Series(mf_rmse_vals)
+    stats["mf_mae"] = pd.Series(mf_mae_vals)
+    stats["mf_rmse"] = stats["mf_rmse"].fillna(0)
+    stats["mf_mae"] = stats["mf_mae"].fillna(0)
+
+    # ── NEW: Cosine similarity to average user profile ───────────────────
+    avg_profile = item_stats["avg_user_profile"]
+
+    cos_sim_vals = {}
+    for user_id, grp in XX.groupby("user"):
+        items = grp["item"].values
+        ratings = grp["rating"].values.astype(float)
+        # Build user's rating vector in SVD item space
+        user_vec = np.zeros(n_items_svd)
+        for it, r in zip(items, ratings):
+            if it in svd_item_map:
+                idx = svd_item_map[it]
+                user_vec[idx] = r - svd_global_mean
+        if np.linalg.norm(user_vec) < 1e-9 or np.linalg.norm(avg_profile) < 1e-9:
+            cos_sim_vals[user_id] = 0.0
+        else:
+            cos_sim_vals[user_id] = cosine_similarity(
+                user_vec.reshape(1, -1), avg_profile.reshape(1, -1)
+            )[0, 0]
+
+    stats["cosine_sim_to_avg"] = pd.Series(cos_sim_vals)
+    stats["cosine_sim_to_avg"] = stats["cosine_sim_to_avg"].fillna(0)
 
     return stats.reset_index()
 
