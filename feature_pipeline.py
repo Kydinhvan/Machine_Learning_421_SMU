@@ -29,7 +29,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import entropy
 
-
+TOTAL_ITEMS = 1000
 RATING_RANGE = range(6)
 
 
@@ -170,7 +170,7 @@ def compute_item_stats(XX_train: pd.DataFrame) -> dict:
 def build_features(
     XX: pd.DataFrame,
     item_stats: dict,
-    total_items: int,
+    total_items: int=TOTAL_ITEMS,
 ) -> pd.DataFrame:
     """Build user-level features from raw interactions.
 
