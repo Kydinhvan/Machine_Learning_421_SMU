@@ -37,7 +37,156 @@ TOTAL_ITEMS = 1000
 RATING_RANGE = range(6)
 
 
-# ── 0. Combine labeled data ────────────────────────────────────────────────
+# ── 0a. Generate synthetic anomalies ──────────────────────────────────────
+
+
+def generate_synthetic_anomalies(
+    XX_train: pd.DataFrame,
+    yy: pd.DataFrame,
+    n_per_type: int = 30,
+    seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Generate diverse synthetic anomalous users and append to training data.
+
+    Creates 10 anomaly types so the model learns general anomalousness
+    rather than memorising a single generation procedure.
+
+    Call BEFORE compute_item_stats() so item stats reflect the augmented data.
+    Returns updated (XX_train, yy) with synthetic users appended.
+    """
+    rng = np.random.RandomState(seed)
+
+    # Learn normal-user statistics to make realistic fakes
+    normal_users = set(yy.loc[yy["label"] == 0, "user"].values)
+    XX_normal = XX_train[XX_train["user"].isin(normal_users)]
+    counts_per_user = XX_normal.groupby("user").size()
+    median_count = int(counts_per_user.median())
+    mean_count = int(counts_per_user.mean())
+
+    item_pop = XX_normal.groupby("item")["user"].count()
+    all_items = np.arange(TOTAL_ITEMS)
+    popular_items = item_pop.nlargest(100).index.values
+    rare_items = item_pop.nsmallest(100).index.values
+    item_avg = XX_normal.groupby("item")["rating"].mean()
+
+    max_uid = max(XX_train["user"].max(), yy["user"].max()) + 1
+    uid = max_uid
+
+    all_rows = []
+    all_labels = []
+
+    def _add_user(items, ratings):
+        nonlocal uid
+        n = len(items)
+        rows = np.column_stack([
+            np.full(n, uid, dtype=int),
+            items.astype(int),
+            np.clip(np.round(ratings), 0, 5).astype(int),
+        ])
+        all_rows.append(rows)
+        all_labels.append([uid, 1])
+        uid += 1
+
+    def _random_items(n, pool=None):
+        pool = all_items if pool is None else pool
+        return rng.choice(pool, size=min(n, len(pool)), replace=False)
+
+    # Type 1: Random rater (uniform random ratings)
+    for _ in range(n_per_type):
+        n = rng.randint(median_count // 2, median_count * 2)
+        items = _random_items(n)
+        ratings = rng.randint(0, 6, size=len(items)).astype(float)
+        _add_user(items, ratings)
+
+    # Type 2: Love bomber (all high ratings)
+    for _ in range(n_per_type):
+        n = rng.randint(median_count // 2, median_count * 2)
+        items = _random_items(n)
+        ratings = rng.choice([4, 5], size=len(items)).astype(float)
+        _add_user(items, ratings)
+
+    # Type 3: Hate rater (all low ratings)
+    for _ in range(n_per_type):
+        n = rng.randint(median_count // 2, median_count * 2)
+        items = _random_items(n)
+        ratings = rng.choice([0, 1], size=len(items)).astype(float)
+        _add_user(items, ratings)
+
+    # Type 4: Bimodal (only 0s and 5s)
+    for _ in range(n_per_type):
+        n = rng.randint(median_count // 2, median_count * 2)
+        items = _random_items(n)
+        ratings = rng.choice([0, 5], size=len(items)).astype(float)
+        _add_user(items, ratings)
+
+    # Type 5: Bandwagon (only popular items, positive ratings)
+    for _ in range(n_per_type):
+        n = rng.randint(30, min(100, len(popular_items)))
+        items = _random_items(n, popular_items)
+        ratings = rng.randint(3, 6, size=len(items)).astype(float)
+        _add_user(items, ratings)
+
+    # Type 6: Niche targeter (only rare items)
+    for _ in range(n_per_type):
+        n = rng.randint(20, min(80, len(rare_items)))
+        items = _random_items(n, rare_items)
+        ratings = rng.randint(0, 6, size=len(items)).astype(float)
+        _add_user(items, ratings)
+
+    # Type 7: Average mimic (rates near item averages, random items)
+    for _ in range(n_per_type):
+        n = rng.randint(median_count // 2, median_count * 2)
+        items = _random_items(n)
+        ratings = np.array([
+            item_avg.get(it, 3.0) + rng.normal(0, 0.3) for it in items
+        ])
+        _add_user(items, ratings)
+
+    # Type 8: Reverse rater (opposite of item averages)
+    for _ in range(n_per_type):
+        n = rng.randint(median_count // 2, median_count * 2)
+        items = _random_items(n)
+        ratings = np.array([
+            5.0 - item_avg.get(it, 2.5) + rng.normal(0, 0.5) for it in items
+        ])
+        _add_user(items, ratings)
+
+    # Type 9: High volume spammer
+    for _ in range(n_per_type):
+        n = rng.randint(mean_count * 3, mean_count * 5)
+        n = min(n, TOTAL_ITEMS)
+        items = _random_items(n)
+        ratings = rng.randint(0, 6, size=len(items)).astype(float)
+        _add_user(items, ratings)
+
+    # Type 10: Shifted normal (copy real user, shift ratings ±2)
+    normal_uids = list(normal_users)
+    for _ in range(n_per_type):
+        src_uid = rng.choice(normal_uids)
+        src = XX_normal[XX_normal["user"] == src_uid]
+        shift = rng.choice([-2, -1, 1, 2])
+        items = src["item"].values
+        ratings = (src["rating"].values + shift).astype(float)
+        _add_user(items, ratings)
+
+    # Combine
+    synth_interactions = np.vstack(all_rows)
+    synth_XX = pd.DataFrame(synth_interactions, columns=["user", "item", "rating"])
+    synth_yy = pd.DataFrame(all_labels, columns=["user", "label"])
+
+    n_synth = len(synth_yy)
+    XX_aug = pd.concat([XX_train, synth_XX], ignore_index=True)
+    yy_aug = pd.concat([yy, synth_yy], ignore_index=True)
+
+    print(f"Generated {n_synth} synthetic anomalous users (10 types x {n_per_type})")
+    print(f"  Training: {len(yy)} -> {len(yy_aug)} users "
+          f"({int(yy['label'].sum())} + {n_synth} = "
+          f"{int(yy_aug['label'].sum())} anomalous)")
+
+    return XX_aug, yy_aug
+
+
+# ── 0b. Combine labeled data ─────────────────────────────────────────────
 
 
 def combine_labeled_data(
@@ -459,3 +608,24 @@ def get_test_labels(labeled_test_path: str, test_df: pd.DataFrame) -> np.ndarray
 def get_feature_columns(df: pd.DataFrame) -> list[str]:
     """Return feature column names (excludes 'user' and 'label')."""
     return [c for c in df.columns if c not in ("user", "label")]
+
+
+# Features computed purely from a user's own ratings — no dependency on
+# frozen training item stats, so they are robust to distribution shift.
+ROBUST_FEATURES = [
+    "rating_mean", "rating_std", "rating_median", "rating_min", "rating_max",
+    "rating_count", "rating_range", "rating_skew", "rating_kurt",
+    "rating_entropy",
+    "prop_rating_0", "prop_rating_1", "prop_rating_2",
+    "prop_rating_3", "prop_rating_4", "prop_rating_5",
+    "prop_extreme", "prop_zero", "prop_five",
+    "prop_mid", "extreme_mid_ratio", "prop_near_extreme",
+    "unique_items_rated", "item_coverage_ratio",
+    "rating_count_vs_median", "rating_count_log", "repeat_rating_ratio",
+    "item_selection_gini",
+]
+
+
+def get_robust_feature_columns() -> list[str]:
+    """Return only shift-resistant feature names (no training-stat dependency)."""
+    return list(ROBUST_FEATURES)
