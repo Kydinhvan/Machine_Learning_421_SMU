@@ -195,8 +195,8 @@ def combine_labeled_data(
 ) -> str:
     """Merge multiple labeled .npz files into one that load_data() can read.
 
-    Duplicate interactions are dropped. If a user appears in more than one
-    file, their label is taken from the first file that contains them.
+    If a user appears in more than one file, their label is taken 
+    from the first file that contains them.
 
     Returns output_path so it can be passed straight to load_data().
     """
@@ -208,7 +208,7 @@ def combine_labeled_data(
         all_X.append(pd.DataFrame(data["X"], columns=["user", "item", "rating"]))
         all_y.append(pd.DataFrame(data["y"], columns=["user", "label"]))
 
-    XX = pd.concat(all_X, ignore_index=True).drop_duplicates()
+    XX = pd.concat(all_X, ignore_index=True)
     yy = pd.concat(all_y, ignore_index=True).drop_duplicates(
         subset="user", keep="first"
     )
@@ -227,20 +227,33 @@ def combine_labeled_data(
 # ── 1. Load data ───────────────────────────────────────────────────────────
 
 
+def load_npz(path: str) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    """Load a single .npz file. Returns (interactions, labels).
+
+    Labels is None if the file has no 'y' key (unlabeled test data).
+
+    Example::
+
+        XX, yy = load_npz("data/training_batch_with_labels.npz")  # labeled
+        XX, _  = load_npz("data/second_batch.npz")                # unlabeled
+    """
+    data = np.load(path)
+    XX = pd.DataFrame(data["X"], columns=["user", "item", "rating"])
+    yy = None
+    if "y" in data:
+        yy = pd.DataFrame(data["y"], columns=["user", "label"])
+    return XX, yy
+
+
 def load_data(train_path: str, test_path: str | None = None):
-    """Load raw interaction data from .npz files.
+    """Load training + optional test data from .npz files.
 
     Returns (XX_train, yy, XX_test).  XX_test is None when test_path is omitted.
     """
-    data = np.load(train_path)
-    XX_train = pd.DataFrame(data["X"], columns=["user", "item", "rating"])
-    yy = pd.DataFrame(data["y"], columns=["user", "label"])
-
+    XX_train, yy = load_npz(train_path)
     XX_test = None
     if test_path is not None:
-        test_data = np.load(test_path)
-        XX_test = pd.DataFrame(test_data["X"], columns=["user", "item", "rating"])
-
+        XX_test, _ = load_npz(test_path)
     return XX_train, yy, XX_test
 
 
@@ -371,7 +384,7 @@ def _gini(array):
 def build_features(
     XX: pd.DataFrame,
     item_stats: dict,
-    total_items: int = TOTAL_ITEMS,
+    total_items: int=TOTAL_ITEMS,
 ) -> pd.DataFrame:
     """Build user-level features from raw interactions.
 
@@ -595,8 +608,6 @@ def build_features(
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
-
-
 def get_test_labels(labeled_test_path: str, test_df: pd.DataFrame) -> np.ndarray:
     """Load ground-truth labels and align with user order in test_df."""
     data = np.load(labeled_test_path)
